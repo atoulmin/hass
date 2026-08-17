@@ -113,7 +113,9 @@ class FakeHA:
     def __init__(self, auth_mode="ok", drop_after=None, fail_calls=False,
                  giant_frame=False, fail_requests=None, delays=None,
                  invalid_message=False, empty_fragments=0,
-                 host="127.0.0.1", tls=False, echo_auth_token=False):
+                 host="127.0.0.1", tls=False, echo_auth_token=False,
+                 fail_conversations=False, echo_conversation_token=False,
+                 hostile_conversation=False):
         self.auth_mode = auth_mode
         self.drop_after = drop_after
         # Reject every call_service. Home Assistant does this for a service
@@ -130,6 +132,11 @@ class FakeHA:
         self.host = host
         self.tls = tls
         self.echo_auth_token = echo_auth_token
+        self.fail_conversations = fail_conversations
+        self.echo_conversation_token = echo_conversation_token
+        self.hostile_conversation = hostile_conversation
+        self.last_token = ""
+        self.conversations = []
         self.connections = 0
         self.states = [
             {"entity_id": "light.test", "state": "off",
@@ -207,6 +214,7 @@ class FakeHA:
         msg_id = msg.get("id")
 
         if kind == "auth":
+            self.last_token = str(msg.get("access_token") or "")
             reject = (self.auth_mode == "invalid"
                       or (self.auth_mode == "invalid_once" and index == 1))
             if reject:
@@ -271,6 +279,38 @@ class FakeHA:
             send_json(conn, {"type": "event", "event": {
                 "event_type": "state_changed",
                 "data": {"entity_id": "light.test", "new_state": self.states[0]}}})
+        elif kind == "assist_pipeline/run":
+            self.conversations.append(msg)
+            if self.fail_conversations:
+                send_json(conn, {"id": msg_id, "type": "result", "success": False,
+                                 "error": {"code": "pipeline-not-found",
+                                           "message": "Assist pipeline failed"}})
+                return
+            send_json(conn, {"id": msg_id, "type": "result", "success": True, "result": None})
+            if self.hostile_conversation:
+                send_json(conn, {"id": msg_id, "type": "event",
+                                 "event": {"type": "intent-end", "data": ["nope"]}})
+                send_json(conn, {"id": msg_id, "type": "event",
+                                 "event": {"type": "run-end", "data": {}}})
+                return
+            speech = "Turned Test Light on"
+            if self.echo_conversation_token:
+                speech = "Heard token " + self.last_token
+            conversation_id = msg.get("conversation_id") or "conv-test"
+            send_json(conn, {"id": msg_id, "type": "event", "event": {
+                "type": "run-start", "data": {"pipeline": "preferred", "language": "en"}}})
+            send_json(conn, {"id": msg_id, "type": "event", "event": {
+                "type": "intent-end",
+                "data": {"intent_output": {
+                    "continue_conversation": False,
+                    "conversation_id": conversation_id,
+                    "response": {
+                        "response_type": "action_done",
+                        "speech": {"plain": {"speech": speech}},
+                    },
+                }}}})
+            send_json(conn, {"id": msg_id, "type": "event",
+                             "event": {"type": "run-end", "data": {}}})
         else:
             send_json(conn, {"id": msg_id, "type": "result", "success": False,
                              "error": {"code": "unknown", "message": "no such command"}})

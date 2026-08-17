@@ -18,6 +18,11 @@ Commands (stdin)
         process running as this user.
     {"op":"call_service","domain":"light","service":"turn_on",
      "entity_id":"light.x","data":{"brightness_pct":40},"tag":"..."}
+    {"op":"conversation","text":"turn off the lights",
+     "conversation_id":"...","tag":"..."}
+        Run the preferred Assist pipeline from text (intent stage only).
+    {"op":"snapshots","entities":["camera.frontyard"],"dest":"...","tag":"..."}
+        Fetch still JPEGs for the open panel. Runs off the websocket thread.
     {"op":"refresh"}       re-request the full state snapshot
     {"op":"registries"}    re-request area/entity/device registries
     {"op":"shutdown"}
@@ -31,6 +36,7 @@ Events (stdout)
     {"ev":"removed","entity_id":"..."}        entity disappeared
     {"ev":"registries","areas":[...],"entities":[...],"devices":[...]}
     {"ev":"config","unit_temperature":"°C"}   instance-wide unit system
+    {"ev":"snapshots","frames":[{"entity_id":"...","path":"...","ok":true}]}
     {"ev":"result","tag":"...","ok":true,"error":"...",
      "errorKind":"command"}
     {"ev":"log","level":"info|warn","msg":"..."}
@@ -47,12 +53,15 @@ import json
 import os
 import queue
 import random
+import re
 import socket
 import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 # Runtime bytecode doesn't belong in the plugin checkout and isn't useful for
 # a small long-lived helper. Set this before loading the vendored package.
@@ -84,6 +93,114 @@ WS_SCHEMES = {"https": "wss", "http": "ws", "wss": "wss", "ws": "ws"}
 # How long we wait for Home Assistant to answer a request before giving the
 # shell its error back.
 REQUEST_TIMEOUT = 5.0
+
+# Assist pipelines (especially LLM conversation agents) are slower than a
+# light toggle. The initial assist_pipeline/run acknowledgement still uses
+# REQUEST_TIMEOUT; this budget covers intent-end / run-end after that.
+CONVERSATION_TIMEOUT = 90.0
+MAX_CONVERSATION_TEXT = 1000
+MAX_CONVERSATION_ID = 128
+MAX_SPEECH = 4000
+ALLOWED_RESPONSE_TYPES = {"action_done", "query_answer", "error"}
+CAMERA_ID_RE = re.compile(r"^camera\.[a-z0-9_]+$")
+MAX_SNAPSHOT_ENTITIES = 4
+MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
+SNAPSHOT_TIMEOUT = 5.0
+HTTP_SCHEMES = {"https": "https", "http": "http", "wss": "https", "ws": "http"}
+
+
+def parse_intent_output(raw):
+    """Pull the fields the shell may render from an Assist intent_output."""
+    if not isinstance(raw, dict):
+        return {}
+
+    conversation_id = raw.get("conversation_id")
+    if not isinstance(conversation_id, str):
+        conversation_id = ""
+    conversation_id = conversation_id.strip()[:MAX_CONVERSATION_ID]
+    if any(ord(ch) < 32 for ch in conversation_id):
+        conversation_id = ""
+
+    response = raw.get("response") if isinstance(raw.get("response"), dict) else {}
+    response_type = response.get("response_type")
+    if response_type not in ALLOWED_RESPONSE_TYPES:
+        response_type = ""
+
+    speech = ""
+    speech_obj = response.get("speech") if isinstance(response.get("speech"), dict) else {}
+    for key in ("plain", "ssml"):
+        part = speech_obj.get(key)
+        if isinstance(part, dict) and isinstance(part.get("speech"), str):
+            speech = part["speech"]
+            break
+    speech = speech.strip()[:MAX_SPEECH]
+
+    return {
+        "speech": speech,
+        "conversation_id": conversation_id,
+        "continue_conversation": bool(raw.get("continue_conversation")),
+        "response_type": response_type,
+    }
+
+
+def normalize_camera_ids(raw):
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, str) or not CAMERA_ID_RE.fullmatch(item):
+            continue
+        if item in out:
+            continue
+        out.append(item)
+        if len(out) >= MAX_SNAPSHOT_ENTITIES:
+            break
+    return out
+
+
+def normalize_camera_dest(raw):
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    path = os.path.abspath(raw)
+    home = os.path.expanduser("~")
+    root = os.path.join(home, ".cache", "omarchy", "hass")
+    if path != root and not path.startswith(root + os.sep):
+        return ""
+    if ".." in path.split(os.sep):
+        return ""
+    return path
+
+
+def fetch_camera_snapshot(base, token, entity_id, dest, verify_tls=True):
+    url = base.rstrip("/") + "/api/camera_proxy/" + entity_id
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Authorization", "Bearer " + (token or ""))
+    context = None
+    if url.startswith("https://") and not verify_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context) if context else urllib.request.HTTPSHandler(),
+    )
+    try:
+        with opener.open(request, timeout=SNAPSHOT_TIMEOUT) as response:
+            data = response.read(MAX_SNAPSHOT_BYTES + 1)
+    except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
+        return ""
+    if not data or len(data) > MAX_SNAPSHOT_BYTES:
+        return ""
+    if data[:3] != b"\xff\xd8\xff" and data[:8] != b"\x89PNG\r\n\x1a\n":
+        return ""
+    ext = ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else ".jpg"
+    filename = entity_id.replace(".", "_") + ext
+    path = os.path.join(dest, filename)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, path)
+    return path
 
 # Home Assistant's largest message is the initial get_states snapshot. Keep a
 # documented finite ceiling for both complete messages and individual frames;
@@ -343,6 +460,13 @@ class DemoTransport:
             self._ok(msg_id, {"unit_system": {"temperature": "°C"}})
         elif kind == "call_service":
             self._call_service(obj)
+        elif kind == "assist_pipeline/run":
+            self._assist(obj)
+        elif kind == "assist_pipeline/pipeline/list":
+            self._ok(msg_id, {
+                "pipelines": [{"id": "demo", "name": "Demo Assist"}],
+                "preferred_pipeline": "demo",
+            })
         else:
             self._fail(msg_id, "demo backend does not implement %s" % kind)
 
@@ -435,6 +559,76 @@ class DemoTransport:
             return
 
         self._ok(msg_id, None)
+
+    def _assist(self, obj):
+        msg_id = obj.get("id")
+        raw_input = obj.get("input") if isinstance(obj.get("input"), dict) else {}
+        text = raw_input.get("text") if isinstance(raw_input.get("text"), str) else ""
+        text = text.strip()
+        if not text:
+            self._fail(msg_id, "No text provided.")
+            return
+        if obj.get("start_stage") != "intent" or obj.get("end_stage") != "intent":
+            self._fail(msg_id, "demo Assist only accepts text intent runs.")
+            return
+
+        self._ok(msg_id, None)
+        speech, response_type = self._assist_reply(text.lower())
+        conversation_id = obj.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            conversation_id = "demo-conversation"
+
+        self._emit({
+            "id": msg_id,
+            "type": "event",
+            "event": {"type": "run-start", "data": {"pipeline": "demo", "language": "en"}},
+        })
+        self._emit({
+            "id": msg_id,
+            "type": "event",
+            "event": {
+                "type": "intent-end",
+                "data": {
+                    "intent_output": {
+                        "continue_conversation": False,
+                        "conversation_id": conversation_id,
+                        "response": {
+                            "response_type": response_type,
+                            "language": "en",
+                            "speech": {"plain": {"speech": speech}},
+                        },
+                    }
+                },
+            },
+        })
+        self._emit({
+            "id": msg_id,
+            "type": "event",
+            "event": {"type": "run-end", "data": {}},
+        })
+
+    def _assist_reply(self, text):
+        if "lamp" in text:
+            if "off" in text:
+                self._set_state("light.living_room_lamp", "off")
+                self._set_attrs("light.living_room_lamp", {
+                    "brightness": None, "color_mode": None})
+                return "Turned off Living Room Lamp", "action_done"
+            self._set_state("light.living_room_lamp", "on")
+            return "Turned on Living Room Lamp", "action_done"
+        if "temperature" in text:
+            sensor = self._states["sensor.kitchen_temperature"]
+            return "Kitchen Temperature is %s degrees" % sensor["state"], "query_answer"
+        if "movie" in text:
+            self._set_state("scene.living_room_movie_night", "scening")
+            self._set_state("light.living_room_lamp", "on")
+            return "Activated Movie Night", "action_done"
+        if "garage" in text and ("open" in text or "close" in text):
+            nxt = "open" if "open" in text else "closed"
+            self._set_state("cover.garage_door", nxt)
+            verb = "Opened" if nxt == "open" else "Closed"
+            return "%s Garage Door" % verb, "action_done"
+        return "Sorry, I didn't understand that", "error"
 
     def _advance_playlist(self, entity_id, step):
         self._playlist_index = (self._playlist_index + step) % len(DEMO_PLAYLIST)
@@ -539,6 +733,7 @@ class Bridge:
         self._out_lock = threading.Lock()
         self._commands = queue.Queue()
         self._command_event = threading.Event()
+        self._snapshot_inflight = False
 
     # -- output -----------------------------------------------------------
 
@@ -547,7 +742,7 @@ class Bridge:
         obj.setdefault("protocolVersion", PROTOCOL_VERSION)
         if obj.get("ev") in {
                 "phase", "states", "state_changed", "removed",
-                "registries", "config", "result", "log"}:
+                "registries", "config", "snapshots", "pipelines", "result", "log"}:
             obj.setdefault("generation", self.generation)
         line = json.dumps(obj, ensure_ascii=False)
         with self._out_lock:
@@ -558,10 +753,14 @@ class Bridge:
         self.emit({"ev": "log", "level": level, "msg": msg,
                    "errorKind": "warning"})
 
-    def safe_error(self, error, fallback="Home Assistant request failed."):
-        text = str(error or "").strip() or fallback
+    def redact(self, text):
+        text = str(text or "")
         if self.token:
             text = text.replace(self.token, "[redacted]")
+        return text
+
+    def safe_error(self, error, fallback="Home Assistant request failed."):
+        text = self.redact(error).strip() or fallback
         return text[:1000]
 
     def set_phase(self, phase, error="", force=False, error_kind="connection"):
@@ -634,6 +833,12 @@ class Bridge:
             self.request_registries()
         elif op == "call_service":
             self.call_service(command)
+        elif op == "conversation":
+            self.conversation(command)
+        elif op == "snapshots":
+            self.snapshots(command)
+        elif op == "pipelines":
+            self.request_pipelines()
         else:
             self.log("warn", "unknown op %r" % op)
 
@@ -685,6 +890,36 @@ class Bridge:
         self.request("get_states", {"type": "get_states"})
         self.request_registries()
         self.request("config", {"type": "get_config"})
+        self.request_pipelines()
+
+    def request_pipelines(self):
+        if not self.authenticated:
+            return
+        self.request("pipelines", {"type": "assist_pipeline/pipeline/list"})
+
+    def emit_pipelines(self, result):
+        raw = result if isinstance(result, dict) else {}
+        pipelines = raw.get("pipelines")
+        out = []
+        if isinstance(pipelines, list):
+            for item in pipelines:
+                if not isinstance(item, dict):
+                    continue
+                ident = item.get("id")
+                name = item.get("name")
+                if not isinstance(ident, str) or not ident:
+                    continue
+                if not isinstance(name, str) or not name.strip():
+                    name = ident
+                out.append({"id": ident[:128], "name": name.strip()[:80]})
+        preferred = raw.get("preferred_pipeline")
+        if not isinstance(preferred, str):
+            preferred = ""
+        self.emit({
+            "ev": "pipelines",
+            "pipelines": out,
+            "preferred": preferred[:128],
+        })
 
     def call_service(self, command):
         domain = command.get("domain")
@@ -714,6 +949,88 @@ class Bridge:
             payload["target"] = {"entity_id": entity_id}
         self.request("call_service", payload, tag=tag)
 
+    def conversation(self, command):
+        tag = command.get("tag")
+        text = command.get("text")
+        if not isinstance(text, str) or not text.strip():
+            self.emit_result(tag, False, "Type something for Assist.")
+            return
+        text = text.strip()[:MAX_CONVERSATION_TEXT]
+        conversation_id = command.get("conversation_id") or ""
+        if not isinstance(conversation_id, str):
+            conversation_id = ""
+        conversation_id = conversation_id.strip()[:MAX_CONVERSATION_ID]
+        if any(ord(ch) < 32 for ch in conversation_id):
+            conversation_id = ""
+
+        payload = {
+            "type": "assist_pipeline/run",
+            "start_stage": "intent",
+            "end_stage": "intent",
+            "input": {"text": text},
+            "timeout": CONVERSATION_TIMEOUT,
+        }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+        pipeline = command.get("pipeline") or ""
+        if isinstance(pipeline, str):
+            pipeline = pipeline.strip()
+            if pipeline and all(ch.isalnum() or ch in "-_" for ch in pipeline):
+                payload["pipeline"] = pipeline[:128]
+        self.request("conversation", payload, tag=tag)
+
+    def snapshots(self, command):
+        tag = command.get("tag")
+        if self.demo:
+            self.emit_result(tag, False, "Snapshots are not available in demo mode.")
+            return
+        if self.phase != "connected" or not self.token or not self.url:
+            self.emit_result(tag, False, "Not connected to Home Assistant.")
+            return
+        if self._snapshot_inflight:
+            return
+        entities = normalize_camera_ids(command.get("entities"))
+        if not entities:
+            self.emit_result(tag, False, "No valid camera entities.")
+            return
+        dest = normalize_camera_dest(command.get("dest"))
+        if not dest:
+            self.emit_result(tag, False, "Invalid snapshot cache directory.")
+            return
+        try:
+            base = self.http_base()
+        except WebSocketError as exc:
+            self.emit_result(tag, False, str(exc))
+            return
+        self._snapshot_inflight = True
+        threading.Thread(
+            target=self._snapshot_worker,
+            args=(self.generation, dest, entities, base, self.token, self.verify_tls),
+            daemon=True,
+        ).start()
+
+    def _snapshot_worker(self, generation, dest, entities, base, token, verify_tls):
+        try:
+            os.makedirs(dest, exist_ok=True)
+            frames = []
+            for entity_id in entities:
+                path = fetch_camera_snapshot(
+                    base, token, entity_id, dest, verify_tls)
+                frames.append({
+                    "entity_id": entity_id,
+                    "path": path or "",
+                    "ok": bool(path),
+                })
+            if generation != self.generation:
+                return
+            self.emit({"ev": "snapshots", "frames": frames, "generation": generation})
+        except Exception as exc:
+            if generation == self.generation:
+                self.log("warn", "snapshot fetch failed: %s" % self.safe_error(exc))
+        finally:
+            if generation == self.generation:
+                self._snapshot_inflight = False
+
     # -- request plumbing --------------------------------------------------
 
     def next_id(self):
@@ -721,20 +1038,40 @@ class Bridge:
         self.msg_id += 1
         return current
 
-    def emit_result(self, tag, ok, error=""):
+    def emit_result(self, tag, ok, error="", extra=None):
         if not tag:
             return
         payload = {"ev": "result", "tag": str(tag), "ok": bool(ok)}
         if error:
             payload["error"] = self.safe_error(error)
             payload["errorKind"] = "command"
+        if extra:
+            for key, value in extra.items():
+                if key in payload:
+                    continue
+                payload[key] = value
         self.emit(payload)
+
+    def emit_conversation_result(self, pending, ok, error="", parsed=None):
+        extra = {}
+        parsed = parsed or {}
+        if ok:
+            speech = parsed.get("speech") or ""
+            if not isinstance(speech, str) or not speech.strip():
+                speech = "Done."
+            extra["speech"] = self.redact(speech).strip()[:MAX_SPEECH] or "Done."
+            conversation_id = parsed.get("conversation_id") or ""
+            extra["conversation_id"] = conversation_id if isinstance(conversation_id, str) else ""
+            extra["continue_conversation"] = bool(parsed.get("continue_conversation"))
+            response_type = parsed.get("response_type") or ""
+            extra["response_type"] = response_type if response_type in ALLOWED_RESPONSE_TYPES else ""
+        self.emit_result(pending.get("tag"), ok, error, extra)
 
     def request(self, kind, payload, tag=None, critical=False, batch=None):
         if not self.transport or not self.authenticated:
             self.emit_result(tag, False, "Not connected to Home Assistant.")
             return None
-        if kind == "call_service" and self.phase != "connected":
+        if kind in ("call_service", "conversation") and self.phase != "connected":
             self.emit_result(tag, False, "Home Assistant is still synchronizing.")
             return None
         msg_id = self.next_id()
@@ -898,6 +1235,15 @@ class Bridge:
             else base_path + "/api/websocket"
         return urllib.parse.urlunsplit((scheme, parts.netloc, path, "", ""))
 
+    def http_base(self):
+        ws = self.websocket_url()
+        parts = urllib.parse.urlsplit(ws)
+        scheme = "https" if parts.scheme == "wss" else "http"
+        path = parts.path
+        if path.endswith("/api/websocket"):
+            path = path[: -len("/api/websocket")]
+        return urllib.parse.urlunsplit((scheme, parts.netloc, path, "", "")).rstrip("/")
+
     def disconnect(self):
         if self.transport:
             try:
@@ -957,6 +1303,7 @@ class Bridge:
         self.request_registries()
         # Climate entities carry no unit of their own; the instance decides.
         self.request("config", {"type": "get_config"})
+        self.request_pipelines()
 
     def on_auth_invalid(self, msg):
         raw_message = msg.get("message") or ""
@@ -1014,6 +1361,13 @@ class Bridge:
             return
 
         result = msg.get("result")
+        if kind == "conversation":
+            # assist_pipeline/run acknowledges immediately, then streams
+            # intent-end / run-end as events on this same request id.
+            pending["deadline"] = now() + CONVERSATION_TIMEOUT
+            pending["pipeline"] = {}
+            self.pending[msg_id] = pending
+            return
         if kind == "subscribe":
             self.subscription_ready = True
             self.maybe_ready()
@@ -1037,6 +1391,8 @@ class Bridge:
             units = units if isinstance(units, dict) else {}
             self.emit({"ev": "config",
                        "unit_temperature": units.get("temperature", "")})
+        elif kind == "pipelines":
+            self.emit_pipelines(result)
         elif tag:
             self.emit_result(tag, True)
 
@@ -1045,6 +1401,13 @@ class Bridge:
             self.set_phase("connected")
 
     def handle_event(self, msg):
+        msg_id = msg.get("id")
+        pending = self.pending.get(msg_id) if isinstance(msg_id, int) else None
+        if pending is not None and pending.get("kind") == "conversation":
+            if pending.get("epoch") == self.transport_epoch:
+                self.handle_pipeline_event(msg_id, pending, msg.get("event"))
+            return
+
         event = msg.get("event") or {}
         if not isinstance(event, dict):
             return
@@ -1061,6 +1424,24 @@ class Bridge:
             return
         if isinstance(new_state, dict) and isinstance(new_state.get("entity_id"), str):
             self.emit({"ev": "state_changed", "entity": new_state})
+
+    def handle_pipeline_event(self, msg_id, pending, event):
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type") or event.get("event_type")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+
+        if kind == "intent-end":
+            pending["pipeline"] = parse_intent_output(data.get("intent_output"))
+        elif kind == "error":
+            raw_message = data.get("message")
+            message = raw_message.strip() if isinstance(raw_message, str) else ""
+            message = message or "Assist could not complete that request."
+            self.pending.pop(msg_id, None)
+            self.emit_conversation_result(pending, False, message)
+        elif kind == "run-end":
+            self.pending.pop(msg_id, None)
+            self.emit_conversation_result(pending, True, "", pending.get("pipeline") or {})
 
     # -- main loop ---------------------------------------------------------
 

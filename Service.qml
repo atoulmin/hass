@@ -6,6 +6,9 @@ import "Connection.js" as Connection
 import "EntityStore.js" as EntityStore
 import "ConfigStore.js" as ConfigStore
 import "RowModel.js" as RowModel
+import "Assist.js" as Assist
+import "Powerwall.js" as Powerwall
+import "Cameras.js" as Cameras
 
 // Owner of all Home Assistant state.
 //
@@ -19,6 +22,7 @@ QtObject {
   readonly property string pluginDir: home + "/.config/omarchy/plugins/hass"
   readonly property string configDir: home + "/.config/omarchy/hass"
   readonly property string configPath: configDir + "/config.json"
+  readonly property string cameraCacheDir: home + "/.cache/omarchy/hass/cameras"
 
   // idle | connecting | connected | error
   property string phase: "idle"
@@ -27,6 +31,12 @@ QtObject {
   property bool configured: false
   property bool demoMode: false
   property string baseUrl: ""
+  property string localUrl: ""
+  property string remoteUrl: ""
+  property string activeRoute: ""
+  property bool remoteAttempted: false
+  property bool triedPairedLookup: false
+  property string pendingRemoteOrigin: ""
   property int connectionGeneration: 0
   property bool connectionSuppressed: false
 
@@ -79,9 +89,19 @@ QtObject {
     onFileChanged: reload()
   }
 
+  property var cameraIds: []
+  property string chargeEntityId: ""
+  property string batteryPowerEntityId: ""
+  property string loadPowerEntityId: ""
+  property string assistPipelineId: ""
+  property var assistPipelines: []
+  property string assistPreferredPipeline: ""
+
   function currentConfig() {
     return {
-      baseUrl: root.baseUrl,
+      baseUrl: root.localUrl,
+      localUrl: root.localUrl,
+      remoteUrl: root.remoteUrl,
       demoMode: root.demoMode,
       favorites: root.liveFavorites.slice(),
       demoFavorites: root.demoFavorites.slice(),
@@ -89,7 +109,12 @@ QtObject {
       showEntityIcons: root.showEntityIcons,
       selectedTab: root.activeTab,
       displayNameOverrides: root.displayNameOverrides,
-      iconOverrides: root.iconOverrides
+      iconOverrides: root.iconOverrides,
+      cameraIds: root.cameraIds.slice(),
+      chargeEntityId: root.chargeEntityId,
+      batteryPowerEntityId: root.batteryPowerEntityId,
+      loadPowerEntityId: root.loadPowerEntityId,
+      assistPipelineId: root.assistPipelineId
     }
   }
 
@@ -112,7 +137,7 @@ QtObject {
   // supposed to enable, which on a fresh install loses the first save silently
   // (printErrors is off). Once, at startup, is early enough for every write.
   property Process configDirProcess: Process {
-    command: ["mkdir", "-p", root.configDir]
+    command: ["mkdir", "-p", root.configDir, root.cameraCacheDir]
   }
 
   Component.onCompleted: root.configDirProcess.running = true
@@ -151,32 +176,87 @@ QtObject {
 
   property CredentialManager credentials: CredentialManager {
     onTokenReady: function(token, origin) {
-      if (!root.demoMode && !root.connectionSuppressed
-          && origin === root.currentOrigin()) {
-        root.pushConfig(token)
-      } else if (!root.connectionSuppressed) {
-        Qt.callLater(root.pushCredentials)
+      if (root.demoMode || root.connectionSuppressed) return
+      if (origin === root.currentOrigin()
+          || (origin && origin === root.localOrigin())
+          || (origin && origin === root.remoteOrigin())) {
+        root.triedPairedLookup = false
+        if (origin === root.currentOrigin()
+            || (root.activeRoute === "remote" && origin === root.localOrigin())) {
+          root.pushConfig(token)
+        }
+        if (root.pendingRemoteOrigin && root.pendingRemoteOrigin !== origin) {
+          var extra = root.pendingRemoteOrigin
+          root.pendingRemoteOrigin = ""
+          credentials.store(token, extra)
+        }
+        return
       }
+      if (!root.connectionSuppressed) Qt.callLater(root.pushCredentials)
     }
     onCleared: function(origin) {
-      if (origin === root.currentOrigin()) root.finishRemoveConnection()
+      if (root.pendingClearOrigins.length) {
+        var next = root.pendingClearOrigins.shift()
+        if (!credentials.clear(next)) root.finishRemoveConnection()
+        return
+      }
+      if (origin === root.localOrigin() || origin === root.remoteOrigin()
+          || !root.localOrigin()) {
+        root.finishRemoveConnection()
+      }
     }
     onFailed: function(message, origin) {
-      if (origin && origin !== root.currentOrigin()) return
+      if (origin && origin !== root.currentOrigin()
+          && origin !== root.localOrigin() && origin !== root.remoteOrigin()) {
+        return
+      }
+      if (!root.triedPairedLookup && origin === root.currentOrigin()) {
+        var other = origin === root.localOrigin() ? root.remoteOrigin()
+          : root.localOrigin()
+        if (other && other !== origin) {
+          root.triedPairedLookup = true
+          if (credentials.lookup(other)) return
+        }
+      }
+      if (origin && origin !== root.currentOrigin()
+          && origin !== root.localOrigin()) return
       root.phase = "error"
       root.lastError = message
       root.lastErrorKind = "credential"
     }
   }
 
+  property var pendingClearOrigins: []
+
+  function localOrigin() {
+    return Connection.normalizeOrigin(root.localUrl)
+  }
+
+  function remoteOrigin() {
+    return Connection.normalizeOrigin(root.remoteUrl)
+  }
+
   function currentOrigin() {
     return Connection.normalizeOrigin(root.baseUrl)
   }
 
-  function requiresTokenFor(url) {
-    var origin = Connection.normalizeOrigin(url)
-    if (!origin) return true
-    return root.demoMode || !root.configured || origin !== root.currentOrigin()
+  function activeUrl() {
+    return root.activeRoute === "remote" ? root.remoteUrl : root.localUrl
+  }
+
+  readonly property string connectionStatus: Connection.connectionLabel(
+    root.demoMode, root.activeRoute, root.remoteUrl)
+
+  function requiresTokenFor(local, remote) {
+    if (root.demoMode) return false
+    var nextLocal = Connection.normalizeOrigin(local)
+    if (!nextLocal && remote !== undefined)
+      nextLocal = Connection.normalizeOrigin(remote)
+    if (!nextLocal) return true
+    if (!root.configured) return true
+    if (nextLocal === root.localOrigin() || nextLocal === root.remoteOrigin())
+      return false
+    return true
   }
 
   function removeConnection() {
@@ -184,16 +264,21 @@ QtObject {
       root.lastError = "Wait for the current keyring operation to finish."
       return
     }
-    var origin = root.currentOrigin()
+    var origins = []
+    if (root.localOrigin()) origins.push(root.localOrigin())
+    if (root.remoteOrigin() && origins.indexOf(root.remoteOrigin()) === -1)
+      origins.push(root.remoteOrigin())
     root.connectionSuppressed = true
     root.disconnectBridge()
     root.appliedConnection = ""
+    root.activeRoute = ""
     root.forgetDevices()
-    if (!origin) {
+    if (!origins.length) {
       root.finishRemoveConnection()
       return
     }
-    if (!credentials.clear(origin)) {
+    root.pendingClearOrigins = origins.slice(1)
+    if (!credentials.clear(origins[0])) {
       root.phase = "error"
       root.lastError = "Could not start token removal while the keyring is busy."
     }
@@ -201,8 +286,11 @@ QtObject {
 
   function finishRemoveConnection() {
     root.connectionSuppressed = false
+    root.pendingClearOrigins = []
+    root.activeRoute = ""
+    root.remoteAttempted = false
     root.saveConfig({
-      baseUrl: "", demoMode: false, favorites: [],
+      baseUrl: "", localUrl: "", remoteUrl: "", demoMode: false, favorites: [],
       displayNameOverrides: {}, iconOverrides: {}, selectedTab: "favorites"
     })   // demoFavorites untouched: not part of the connection
   }
@@ -231,31 +319,56 @@ QtObject {
   function retryConnection() {
     root.connectionSuppressed = false
     root.appliedConnection = ""
+    root.remoteAttempted = false
+    root.triedPairedLookup = false
+    root.activeRoute = root.localUrl ? "local" : (root.remoteUrl ? "remote" : "")
+    root.baseUrl = root.activeUrl()
     root.lastError = ""
     root.reconcileConnection()
   }
 
-  function applyConnection(url, token, demo) {
-    var origin = demo ? "demo" : Connection.normalizeOrigin(url)
-    if (!origin) {
+  function applyConnection(local, remote, token, demo) {
+    if (demo === undefined) {
+      demo = token
+      token = remote
+      remote = ""
+    }
+    var localOrigin = demo ? "demo" : Connection.normalizeOrigin(local)
+    var remoteOrigin = demo ? "" : Connection.normalizeOrigin(remote)
+    if (!localOrigin && !remoteOrigin) {
       root.phase = "error"
-      root.lastError = "Enter a valid http(s) or ws(s) Home Assistant URL."
+      root.lastError = "Enter a local or Nabu Casa Home Assistant URL."
       return false
     }
-    if (!demo && !token && root.requiresTokenFor(url)) {
+    if (!demo && !token && root.requiresTokenFor(local, remote)) {
       root.phase = "error"
       root.lastError = "A new Home Assistant origin requires a new token."
       return false
     }
     root.connectionSuppressed = false
+    root.remoteAttempted = false
+    root.triedPairedLookup = false
+    root.activeRoute = localOrigin ? "local" : "remote"
     // Start the serialized write before applyConfig runs so reconciliation
     // cannot race a lookup of the previous credential.
-    if (!demo && token.length > 0 && !credentials.store(token, origin)) {
+    var storeOrigin = localOrigin || remoteOrigin
+    if (!demo && token.length > 0 && !credentials.store(token, storeOrigin)) {
       root.phase = "error"
       root.lastError = "Could not start token storage while the keyring is busy."
       return false
     }
-    root.saveConfig({ baseUrl: url, demoMode: demo })
+    if (!demo && token.length > 0 && remoteOrigin && localOrigin
+        && remoteOrigin !== localOrigin) {
+      root.pendingRemoteOrigin = remoteOrigin
+    } else {
+      root.pendingRemoteOrigin = ""
+    }
+    root.saveConfig({
+      localUrl: local || "",
+      remoteUrl: remote || "",
+      baseUrl: local || remote || "",
+      demoMode: demo
+    })
     return true
   }
 
@@ -279,7 +392,17 @@ QtObject {
     if (parsed.error) root.lastError = parsed.error
 
     root.demoMode = config.demoMode
-    root.baseUrl = config.baseUrl
+    root.localUrl = config.localUrl
+    root.remoteUrl = config.remoteUrl
+    if (!root.activeRoute) {
+      root.activeRoute = config.localUrl ? "local"
+        : (config.remoteUrl ? "remote" : "")
+    } else if (root.activeRoute === "local" && !config.localUrl) {
+      root.activeRoute = config.remoteUrl ? "remote" : ""
+    } else if (root.activeRoute === "remote" && !config.remoteUrl) {
+      root.activeRoute = config.localUrl ? "local" : ""
+    }
+    root.baseUrl = root.activeUrl()
     root.liveFavorites = config.favorites
     root.demoFavorites = config.demoFavorites
     root.displayNameOverrides = config.displayNameOverrides
@@ -287,8 +410,14 @@ QtObject {
     root.groupByArea = config.groupByArea
     root.showEntityIcons = config.showEntityIcons
     root.activeTab = config.selectedTab
+    root.cameraIds = config.cameraIds
+    root.chargeEntityId = config.chargeEntityId
+    root.batteryPowerEntityId = config.batteryPowerEntityId
+    root.loadPowerEntityId = config.loadPowerEntityId
+    root.assistPipelineId = config.assistPipelineId
 
-    root.configured = root.demoMode || root.baseUrl.length > 0
+    root.configured = root.demoMode
+      || root.localUrl.length > 0 || root.remoteUrl.length > 0
     rebuildSortedIds()
     rebuildRows()
     root.reconcileConnection()
@@ -307,6 +436,9 @@ QtObject {
     root.temperatureUnit = ""
     root.pendingToggles = ({})
     pendingSweep.running = false
+    root.resetAssist(true)
+    root.cameraPaths = ({})
+    root.cameraRevision++
     root.rebuildRows()
   }
 
@@ -317,6 +449,7 @@ QtObject {
 
   function reconcileConnection() {
     if (root.connectionSuppressed) return
+    root.baseUrl = root.activeUrl()
 
     if (!root.configured) {
       if (root.appliedConnection !== "") {
@@ -333,7 +466,7 @@ QtObject {
 
     // Connection.js owns this rule, so the definition of "same connection"
     // cannot drift from the one the tests pin.
-    var signature = Connection.signature(root.demoMode, root.baseUrl)
+    var signature = Connection.signature(root.demoMode, root.activeUrl())
     if (!signature) {
       root.phase = "error"
       root.lastError = "Home Assistant URL is invalid."
@@ -349,6 +482,21 @@ QtObject {
     root.connectionGeneration++
 
     if (root.startBridge()) root.pushCredentials()
+  }
+
+  function considerFailover() {
+    if (root.connectionSuppressed || root.demoMode || root.remoteAttempted) return
+    if (root.activeRoute !== "local") return
+    if (!Connection.normalizeOrigin(root.remoteUrl)) return
+    root.remoteAttempted = true
+    root.triedPairedLookup = false
+    root.activeRoute = "remote"
+    root.baseUrl = root.activeUrl()
+    root.appliedConnection = ""
+    root.lastError = Connection.isNabuCasa(root.remoteUrl)
+      ? "Local unreachable, trying Nabu Casa…"
+      : "Local unreachable, trying the remote URL…"
+    root.reconcileConnection()
   }
 
   // Split out of reconcileConnection because a bridge restart has to redo it:
@@ -391,6 +539,7 @@ QtObject {
     onFailed: function(message) {
       root.phase = "error"
       root.lastError = message
+      root.considerFailover()
     }
   }
 
@@ -425,6 +574,86 @@ QtObject {
       data: data || {},
       tag: tag || ""
     })
+  }
+
+  // ------------------------------------------------------------ assist
+
+  property ListModel assistMessages: ListModel {}
+  property string assistConversationId: ""
+  property bool assistBusy: false
+  property string assistError: ""
+  property int assistSeq: 0
+
+  property Timer assistIdle: Timer {
+    interval: Assist.IDLE_MS
+    repeat: false
+    onTriggered: root.resetAssist(true)
+  }
+
+  function touchAssistIdle() {
+    if (assistMessages.count === 0 && !root.assistBusy) {
+      assistIdle.stop()
+      return
+    }
+    assistIdle.restart()
+  }
+
+  function resetAssist(clearMessages) {
+    assistIdle.stop()
+    root.assistBusy = false
+    root.assistConversationId = ""
+    root.assistError = ""
+    if (clearMessages) assistMessages.clear()
+  }
+
+  function appendAssistMessage(speaker, body) {
+    var row = Assist.messageFor(speaker, body)
+    if (!row.body) return
+    assistMessages.append(row)
+    while (assistMessages.count > Assist.MAX_MESSAGES)
+      assistMessages.remove(0)
+  }
+
+  function sendAssist(text) {
+    var normalized = Assist.normalizeText(text)
+    if (!normalized) return root.rejectAction("Type something for Assist.")
+    if (!root.connected) return root.rejectAction("Not connected to Home Assistant.")
+    if (root.assistBusy) return false
+
+    root.assistSeq += 1
+    var tag = "assist:" + root.assistSeq
+    root.assistBusy = true
+    root.assistError = ""
+    root.appendAssistMessage("user", normalized)
+    var sent = root.send({
+      op: "conversation",
+      text: normalized,
+      conversation_id: root.assistConversationId,
+      pipeline: root.assistPipelineId,
+      tag: tag
+    })
+    if (!sent) {
+      root.assistBusy = false
+      root.appendAssistMessage("error", "Could not reach Home Assistant.")
+      root.touchAssistIdle()
+      return false
+    }
+    root.touchAssistIdle()
+    return true
+  }
+
+  function finishAssist(event) {
+    root.assistBusy = false
+    var projected = Assist.projectResult(event)
+    if (projected.ok) {
+      if (projected.conversationId)
+        root.assistConversationId = projected.conversationId
+      root.appendAssistMessage("assist", projected.speech)
+    } else {
+      root.assistError = projected.error
+      root.appendAssistMessage("error", projected.error)
+    }
+    root.touchAssistIdle()
   }
 
   // ------------------------------------------------------------ actions
@@ -659,6 +888,10 @@ QtObject {
       root.phase = transition.state.phase
       root.lastError = transition.state.error
       root.lastErrorKind = transition.state.errorKind
+      if (root.phase === "error" && root.lastErrorKind !== "credential"
+          && root.lastErrorKind !== "protocol") {
+        root.considerFailover()
+      }
       break
     case "states":
       root.applyStates(event.entities || [])
@@ -679,6 +912,12 @@ QtObject {
       root.temperatureUnit = String(event.unit_temperature || "")
       root.rebuildRows()
       break
+    case "snapshots":
+      root.applySnapshots(event)
+      break
+    case "pipelines":
+      root.applyPipelines(event)
+      break
     case "result":
       root.handleResult(event)
       break
@@ -689,9 +928,14 @@ QtObject {
   }
 
   function handleResult(event) {
+    var tag = String(event.tag || "")
+    if (tag === "snap") return
+    if (tag.indexOf("assist:") === 0) {
+      root.finishAssist(event)
+      if (event.ok === true) return
+    }
     if (event.ok === true) return
 
-    var tag = String(event.tag || "")
     if (tag.indexOf("toggle:") === 0) {
       // Drop the guess now rather than at the sweep timer. On success it
       // stays: the confirming state_changed is already on its way.
@@ -813,6 +1057,138 @@ QtObject {
     root.stateRevision
     for (var key in root.states) return true
     return false
+  }
+
+  readonly property var powerwall: {
+    root.stateRevision
+    return Powerwall.project(
+      root.states, root.chargeEntityId, root.batteryPowerEntityId,
+      root.loadPowerEntityId)
+  }
+
+  readonly property var cameraTiles: {
+    root.stateRevision
+    return Cameras.tiles(root.states, root.cameraIds)
+  }
+
+  readonly property bool camerasAvailable: {
+    root.stateRevision
+    return Cameras.anyAvailable(root.states, root.cameraIds)
+  }
+
+  property var cameraPaths: ({})
+  property int cameraRevision: 0
+  property int cameraWatchers: 0
+
+  property Timer cameraTimer: Timer {
+    interval: 1500
+    repeat: true
+    running: root.cameraWatchers > 0 && root.connected && !root.demoMode
+    triggeredOnStart: true
+    onTriggered: root.requestSnapshots()
+  }
+
+  function setCameraWatching(enabled) {
+    root.cameraWatchers = Math.max(0, root.cameraWatchers + (enabled ? 1 : -1))
+  }
+
+  function requestSnapshots() {
+    if (!root.connected || root.demoMode) return
+    root.send({
+      op: "snapshots",
+      entities: Cameras.ids(root.cameraIds, root.states),
+      dest: root.cameraCacheDir,
+      tag: "snap"
+    })
+  }
+
+  function cameraSource(entityId) {
+    root.cameraRevision
+    return Cameras.fileSource(root.cameraPaths[entityId], root.cameraRevision)
+  }
+
+  function cameraStreamUrl(entityId) {
+    return Cameras.streamUrl(root.baseUrl, entityId, root.states[entityId])
+  }
+
+  function setCameraIds(ids) {
+    root.saveConfig({
+      cameraIds: ConfigStore.stringList(ids, []).filter(function(id) {
+        return id.indexOf("camera.") === 0
+      }).slice(0, 6)
+    })
+  }
+
+  function setBatteryEntities(chargeId, batteryId, loadId) {
+    root.saveConfig({
+      chargeEntityId: ConfigStore.entityId(chargeId),
+      batteryPowerEntityId: ConfigStore.entityId(batteryId),
+      loadPowerEntityId: ConfigStore.entityId(loadId)
+    })
+  }
+
+  function setAssistPipeline(pipelineId) {
+    root.saveConfig({ assistPipelineId: ConfigStore.pipelineId(pipelineId) })
+  }
+
+  function applyPipelines(event) {
+    var raw = event.pipelines
+    var out = []
+    if (raw && raw.length) {
+      for (var i = 0; i < raw.length; i++) {
+        var item = raw[i]
+        if (!item || typeof item.id !== "string" || typeof item.name !== "string")
+          continue
+        out.push({ id: item.id, name: item.name })
+      }
+    }
+    root.assistPipelines = out
+    root.assistPreferredPipeline = typeof event.preferred === "string"
+      ? event.preferred : ""
+  }
+
+  function optionList(kind) {
+    var out = kind === "camera" ? [] : [{ value: "", label: "None" }]
+    var ids = root.sortedEntityIds
+    for (var i = 0; i < ids.length; i++) {
+      var entityId = ids[i]
+      var entity = root.states[entityId]
+      if (!entity) continue
+      var domain = Model.domainOf(entityId)
+      var deviceClass = String((entity.attributes || {}).device_class || "")
+      var unit = String((entity.attributes || {}).unit_of_measurement || "")
+      var keep = false
+      if (kind === "camera") keep = domain === "camera"
+      else if (kind === "battery") {
+        keep = domain === "sensor" && (deviceClass === "battery" || unit === "%")
+      } else if (kind === "power") {
+        keep = domain === "sensor" && (deviceClass === "power"
+          || unit === "kW" || unit === "W")
+      }
+      if (!keep) continue
+      out.push({
+        value: entityId,
+        label: root.displayName(entityId),
+        description: entityId
+      })
+    }
+    return out
+  }
+
+  function applySnapshots(event) {
+    var frames = event.frames
+    if (!frames || !frames.length) return
+    var next = {}
+    var key
+    for (key in root.cameraPaths) next[key] = root.cameraPaths[key]
+    for (var i = 0; i < frames.length; i++) {
+      var frame = frames[i]
+      if (!frame || typeof frame.entity_id !== "string") continue
+      if (frame.ok && typeof frame.path === "string" && frame.path.indexOf("/") === 0)
+        next[frame.entity_id] = frame.path
+    }
+    root.cameraPaths = next
+    root.cameraRevision++
   }
 
   readonly property string activitySummary: {

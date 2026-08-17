@@ -20,6 +20,10 @@ Panel {
   readonly property string phase: serviceReady ? hass.phase : "idle"
 
   property string expandedEntityId: ""
+  property bool cameraViewerOpen: false
+  property string cameraViewerId: ""
+  property string cameraViewerTitle: ""
+  property string cameraStream: ""
 
   // One cursor for keyboard and mouse, per the CursorSurface contract.
   // Dormant until a key is pressed.
@@ -29,11 +33,95 @@ Panel {
   readonly property int rowCount: serviceReady ? hass.rows.count : 0
   readonly property bool hasDevices: serviceReady && hass.hasDevices
   readonly property var tabs: serviceReady ? hass.tabs : []
+  readonly property var powerwall: (serviceReady && hass)
+    ? hass.powerwall
+    : ({ available: false, icon: "", subtitle: "", percentText: "—",
+         fraction: 0, charging: false })
+  readonly property var cameras: (serviceReady && hass) ? hass.cameraTiles : []
+  readonly property bool camerasAvailable: serviceReady && hass && hass.camerasAvailable
 
-  onOpenedChanged: if (!opened) {
-    expandedEntityId = ""
-    cursorActive = false
-    cursorIndex = 0
+  onOpenedChanged: {
+    if (root.serviceReady) root.hass.setCameraWatching(opened)
+    if (!opened) {
+      expandedEntityId = ""
+      cursorActive = false
+      cursorIndex = 0
+      root.closeCameraViewer()
+      return
+    }
+    root.scheduleScrollAssistToEnd()
+  }
+
+  Component.onDestruction: {
+    if (root.opened && root.serviceReady) root.hass.setCameraWatching(false)
+  }
+
+  function cameraSource(entityId) {
+    return root.serviceReady ? root.hass.cameraSource(entityId) : ""
+  }
+
+  function openCameraViewer(cam) {
+    if (!cam || !cam.entityId || !root.serviceReady) return
+    var stream = root.hass.cameraStreamUrl(cam.entityId)
+    if (!stream) return
+    root.cameraViewerId = cam.entityId
+    root.cameraViewerTitle = String(cam.title || "").toUpperCase()
+    root.cameraStream = stream
+    root.cameraViewerOpen = true
+  }
+
+  function closeCameraViewer() {
+    root.cameraViewerOpen = false
+    root.cameraViewerId = ""
+    root.cameraViewerTitle = ""
+    root.cameraStream = ""
+  }
+
+  function submitAssist() {
+    if (!root.serviceReady || root.hass.assistBusy) return
+    if (root.hass.sendAssist(assistInput.text))
+      assistInput.text = ""
+    root.scheduleScrollAssistToEnd()
+  }
+
+  // Wait a frame so wrapped reply height is known, then ease the thread
+  // up to the latest line. The viewport itself is a fixed size.
+  property Timer assistScrollSettle: Timer {
+    interval: 16
+    repeat: false
+    onTriggered: root.scrollAssistToEnd()
+  }
+
+  property NumberAnimation assistScrollAnim: NumberAnimation {
+    target: assistList
+    property: "contentY"
+    duration: 260
+    easing.type: Easing.OutCubic
+  }
+
+  function scheduleScrollAssistToEnd() {
+    assistScrollSettle.restart()
+  }
+
+  function scrollAssistToEnd() {
+    if (!assistList) return
+    var maxY = Math.max(0, assistList.contentHeight - assistList.height)
+    if (Math.abs(assistList.contentY - maxY) < 1) return
+    assistScrollAnim.stop()
+    assistScrollAnim.from = assistList.contentY
+    assistScrollAnim.to = maxY
+    assistScrollAnim.start()
+  }
+
+  function focusAssistInput() {
+    if (assistInput) assistInput.forceActiveFocus()
+    root.cursorActive = false
+  }
+
+  function focusDevicesFromAssist() {
+    assistInput.focus = false
+    keyCatcher.forceActiveFocus()
+    if (root.rowCount > 0) root.cursorActive = true
   }
 
   function moveCursor(delta) {
@@ -100,8 +188,10 @@ Panel {
     if (!hass.configured) return "Not connected"
     switch (phase) {
     case "connected":
-      return (hass.demoMode ? "Demo · " : "") + hass.activitySummary
-    case "connecting": return hass.lastError ? "Retrying" : "Connecting…"
+      return hass.connectionStatus
+    case "connecting":
+      if (hass.lastError) return "Retrying"
+      return hass.activeRoute === "remote" ? "Connecting remotely…" : "Connecting locally…"
     case "error": return "Disconnected"
     default: return "Idle"
     }
@@ -185,6 +275,41 @@ Panel {
       if (!entity) return "unknown entity " + entityId
       return entity.state + " " + JSON.stringify(Model.redactAttributes(entity))
     }
+
+    function assist(text: string): string {
+      if (!root.serviceReady) return "service unavailable"
+      root.open()
+      return root.hass.sendAssist(text)
+        ? "ok" : (root.hass.lastError || "failed")
+    }
+
+    function assistClear(): void {
+      if (root.serviceReady) root.hass.resetAssist(true)
+    }
+  }
+
+  Process {
+    id: cameraPlayer
+    command: [
+      "mpv",
+      "--no-audio",
+      "--mute=yes",
+      "--volume=0",
+      "--force-window=immediate",
+      "--keep-open=no",
+      "--osc=no",
+      "--osd-level=0",
+      "--no-border",
+      "--title=omarchy-hass-camera",
+      "--hwdec=auto-safe",
+      "--profile=low-latency",
+      "--untimed=yes",
+      "--cache=no",
+      "--input-conf=" + (root.serviceReady ? root.hass.pluginDir : "") + "/mpv-preview.conf",
+      root.cameraStream
+    ]
+    running: root.cameraViewerOpen && root.cameraStream !== ""
+    onExited: if (root.cameraViewerOpen) root.closeCameraViewer()
   }
 
   BarIconButton {
@@ -203,17 +328,29 @@ Panel {
     anchorItem: button
     owner: root
     bar: root.bar
-    open: root.opened
-    focusTarget: keyCatcher
+    // Hide the overlay while the stream is open so mpv isn't buried under
+    // the layer-shell panel on short screens.
+    open: root.opened && !root.cameraViewerOpen
+    focusTarget: (root.serviceReady && root.hass && root.hass.connected)
+      ? assistInput : keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      blocked: assistInput.activeFocus || root.cameraViewerOpen
+      onCloseRequested: {
+        if (root.cameraViewerOpen) root.closeCameraViewer()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
+        if (dy < 0 && (!root.cursorActive || root.cursorIndex === 0)
+            && root.serviceReady && root.hass.connected) {
+          root.focusAssistInput()
+          return
+        }
         // The first key press only wakes the cursor.
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -222,6 +359,10 @@ Panel {
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onTextKey: function(key) {
         var lower = String(key).toLowerCase()
+        if (key === "/" && root.serviceReady && root.hass.connected) {
+          root.focusAssistInput()
+          return
+        }
         if (lower === "r" && root.serviceReady) root.hass.refresh()
         else if (lower === "e" && root.cursorActive) root.expandCursor()
         else if (lower === "s") root.openSettings("connection")
@@ -261,6 +402,287 @@ Panel {
         }
 
         PanelSeparator { width: parent.width; foreground: root.fg }
+
+        // ---------- Assist ----------
+        Column {
+          id: assistColumn
+          width: parent.width
+          visible: root.serviceReady && root.hass.connected
+          spacing: Style.spacing.panelGap
+
+          Item {
+            width: parent.width
+            height: Style.space(50)
+
+            ListView {
+              id: assistList
+              anchors.fill: parent
+              clip: true
+              spacing: Style.spacing.lg
+              boundsBehavior: Flickable.StopAtBounds
+              boundsMovement: Flickable.StopAtBounds
+              interactive: true
+              model: root.serviceReady ? root.hass.assistMessages : null
+              bottomMargin: (root.serviceReady && root.hass.assistBusy)
+                ? Style.font.caption + Style.spacing.sm : 0
+              onCountChanged: root.scheduleScrollAssistToEnd()
+              onContentHeightChanged: root.scheduleScrollAssistToEnd()
+              onMovementStarted: assistScrollAnim.stop()
+
+              ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+              }
+
+              delegate: Column {
+                required property int index
+                required property string speaker
+                required property string body
+
+                width: assistList.width
+                spacing: Style.spacing.hairline
+                opacity: 0
+
+                Component.onCompleted: assistFadeIn.start()
+
+                NumberAnimation on opacity {
+                  id: assistFadeIn
+                  from: 0
+                  to: 1
+                  duration: 220
+                  easing.type: Easing.OutCubic
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: speaker === "user" ? "You" : "Assist"
+                  color: speaker === "error" ? Color.urgent : root.dim
+                  font.family: root.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: body
+                  wrapMode: Text.WordWrap
+                  color: speaker === "error" ? Color.urgent : root.fg
+                  font.family: root.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+
+            Text {
+              id: assistGreeting
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "How can I assist you?"
+              wrapMode: Text.WordWrap
+              color: root.fg
+              font.family: root.family
+              font.pixelSize: Style.font.bodySmall
+              visible: root.opened && root.serviceReady && root.hass.connected
+                && assistList.count === 0 && !root.hass.assistBusy
+              opacity: 0
+
+              onVisibleChanged: {
+                assistGreetingDelay.stop()
+                assistGreetingFade.stop()
+                opacity = 0
+                if (visible) assistGreetingDelay.start()
+              }
+
+              Timer {
+                id: assistGreetingDelay
+                interval: 1000
+                repeat: false
+                onTriggered: assistGreetingFade.start()
+              }
+
+              NumberAnimation {
+                id: assistGreetingFade
+                target: assistGreeting
+                property: "opacity"
+                from: 0
+                to: 1
+                duration: 280
+                easing.type: Easing.OutCubic
+              }
+            }
+
+            Text {
+              visible: root.serviceReady && root.hass.assistBusy
+              anchors.left: parent.left
+              anchors.bottom: parent.bottom
+              textFormat: Text.PlainText
+              text: "Assist is thinking…"
+              color: root.dim
+              font.family: root.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          TextField {
+            id: assistInput
+            width: parent.width
+            foreground: root.fg
+            placeholderText: "Ask Assist…"
+            onAccepted: root.submitAssist()
+            Keys.onEscapePressed: root.close()
+            Keys.onDownPressed: root.focusDevicesFromAssist()
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          visible: assistColumn.visible
+          foreground: root.fg
+        }
+
+        // ---------- Cameras ----------
+        Column {
+          id: cameraColumn
+          width: parent.width
+          visible: root.opened && root.serviceReady && root.hass.connected
+            && root.camerasAvailable
+          spacing: Style.spacing.panelGap
+
+          PanelSectionHeader {
+            width: parent.width
+            text: "CAMERAS"
+            foreground: root.fg
+            fontFamily: root.family
+          }
+
+          Row {
+            id: cameraRow
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Repeater {
+              model: root.cameras.length
+              delegate: Column {
+                required property int index
+                readonly property var cam: root.cameras[index] || ({})
+
+                width: (cameraRow.width - cameraRow.spacing * Math.max(0, root.cameras.length - 1))
+                  / Math.max(1, root.cameras.length)
+                spacing: Style.spacing.xxs
+
+                CameraThumb {
+                  width: parent.width
+                  height: Math.round(width * 2 / 3)
+                  fill: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
+                  frame: root.cameraSource(cam.entityId || "")
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openCameraViewer(cam)
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: (cam.title || "").toUpperCase()
+                  color: root.dim
+                  font.family: root.family
+                  font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          visible: cameraColumn.visible
+          foreground: root.fg
+        }
+
+        // ---------- Powerwall ----------
+        Column {
+          id: powerwallColumn
+          width: parent.width
+          visible: root.serviceReady && root.hass.connected && root.powerwall.available
+          spacing: Style.spacing.panelGap
+
+          PanelSectionHeader {
+            width: parent.width
+            text: "POWERWALL"
+            foreground: root.fg
+            fontFamily: root.family
+          }
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(pwGlyph.implicitHeight, pwLabels.implicitHeight,
+                                     pwPercent.implicitHeight)
+
+            Text {
+              id: pwGlyph
+              textFormat: Text.PlainText
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.powerwall.icon
+              color: root.fg
+              font.family: root.family
+              font.pixelSize: Style.font.heading
+            }
+
+            Column {
+              id: pwLabels
+              anchors.left: pwGlyph.right
+              anchors.leftMargin: Style.spacing.xl
+              anchors.right: pwPercent.left
+              anchors.rightMargin: Style.spacing.lg
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.spacing.xxs
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: "Powerwall"
+                color: root.fg
+                font.family: root.family
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: root.powerwall.subtitle
+                color: root.dim
+                font.family: root.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            Text {
+              id: pwPercent
+              textFormat: Text.PlainText
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.powerwall.percentText
+              color: root.fg
+              font.family: root.family
+              font.pixelSize: Style.font.heading
+            }
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          visible: powerwallColumn.visible
+          foreground: root.fg
+        }
 
         // ---------- area tabs ----------
         // ButtonGroup is a Row and does not wrap, so it scrolls instead of

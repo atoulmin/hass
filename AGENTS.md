@@ -27,7 +27,10 @@ first-run downloads. Python 3.11 or newer, `secret-tool`, and the vendored
 - `Model.js`: entity display policy, capabilities, action classification, and
   attribute redaction.
 - `RowModel.js`: projection from an entity into a QML `ListModel` row.
-- `Panel.qml`: bar widget, popup, keyboard navigation, and IPC surface.
+- `Assist.js`: user-text and conversation-id sanitization, transcript rows.
+- `Powerwall.js`: charge, home load, and battery-flow projection for the panel.
+- `Cameras.js`: Frigate camera catalog and snapshot path rules.
+- `Panel.qml`: bar widget, popup, Assist composer, keyboard navigation, and IPC surface.
 - `Settings.qml`: connection settings and entity picker.
 - `controls/`: domain-specific expanded controls.
 - `bin/hass-bridge`: WebSocket protocol adapter and demo backend.
@@ -100,6 +103,9 @@ node tests/test_connection.js
 node tests/test_store.js
 node tests/test_model.js
 node tests/test_row_model.js
+node tests/test_assist.js
+node tests/test_powerwall.js
+node tests/test_cameras.js
 python3 -m py_compile bin/hass-bridge tests/*.py
 bash -n scripts/update-websockets-vendor
 ```

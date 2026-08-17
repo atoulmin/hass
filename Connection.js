@@ -76,6 +76,24 @@ function normalizeOrigin(value) {
 //
 // Empty when the URL cannot be normalized; callers treat that as invalid
 // rather than as a connection worth starting.
+function isNabuCasa(value) {
+  var origin = normalizeOrigin(value)
+  if (!origin) return false
+  var host = origin.slice(origin.indexOf("://") + 3)
+  var colon = host.lastIndexOf(":")
+  if (colon !== -1) host = host.slice(0, colon)
+  return host.indexOf(".ui.nabu.casa") !== -1 || host === "ui.nabu.casa"
+    || host.indexOf(".nabu.casa") !== -1
+}
+
+function connectionLabel(demoMode, route, remoteUrl) {
+  if (demoMode) return "Demo"
+  if (route === "remote") {
+    return isNabuCasa(remoteUrl) ? "Connected via Nabu Casa" : "Connected remotely"
+  }
+  return "Connected locally"
+}
+
 function signature(demoMode, value) {
   if (demoMode) return "demo"
   var origin = normalizeOrigin(value)

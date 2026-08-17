@@ -57,6 +57,16 @@ eq("bad ports are rejected", Connection.normalizeOrigin("https://ha.local:99999"
 eq("an empty explicit port is rejected", Connection.normalizeOrigin("https://ha.local:"), "");
 eq("unknown schemes are rejected", Connection.normalizeOrigin("ftp://ha.local"), "");
 eq("demo has a separate signature", Connection.signature(true, ""), "demo");
+eq("nabu casa hosts are detected",
+   Connection.isNabuCasa("https://abcd1234.ui.nabu.casa"), true);
+eq("local hosts are not nabu casa",
+   Connection.isNabuCasa("http://192.168.0.123:8123"), false);
+eq("local connection label",
+   Connection.connectionLabel(false, "local", ""), "Connected locally");
+eq("nabu casa connection label",
+   Connection.connectionLabel(false, "remote", "https://x.ui.nabu.casa"),
+   "Connected via Nabu Casa");
+eq("demo connection label", Connection.connectionLabel(true, "local", ""), "Demo");
 // The signature is what reconcileConnection compares to decide whether the
 // running bridge is still the right one, so it has to pin the URL text and not
 // just the credential origin.

@@ -1,8 +1,8 @@
 # Home Assistant for Omarchy
 
-View and control your Home Assistant devices from the Omarchy bar.
+Talk to Assist and control your Home Assistant devices from the Omarchy bar.
 
-Quickshell plugin for **Omarchy 4**. Pick the devices and toggle lights, adjust climate, drive media, and open covers.
+Quickshell plugin for **Omarchy 4**. Ask Assist in plain language, pick favorite devices, and toggle lights, adjust climate, drive media, and open covers.
 
 > Not affiliated with or endorsed by the Home Assistant project.
 
@@ -16,11 +16,38 @@ Quickshell plugin for **Omarchy 4**. Pick the devices and toggle lights, adjust 
 
 ![Home Assistant demo device list and panel favorites using the Solitude theme](docs/screenshots/demo-devices-and-favorites.png)
 
+## Assist
+
+With the panel open, type in the Assist field and press Enter. The request
+goes to your Home Assistant instance's preferred Assist pipeline — the same
+conversation agent your Voice PE / Assist setup uses. Follow-ups stay in the
+same conversation until a minute of silence, a reconnect, or
+`omarchy-shell hass assistClear`.
+
+Voice (push-to-talk) is not in this version.
+
+## Cameras and energy
+
+Settings → **Panel** picks the cameras and battery sensors to show.
+
+While the panel is open, selected cameras render silent stills. Click a
+still to play the high-bitrate go2rtc/RTSP stream in a floating `mpv`
+window (no audio). Escape or a click on the video closes it.
+
+An energy row can show charge percentage, battery power, and home load
+when those sensors are configured.
+
+The hero status is the connection path: **Connected locally** or
+**Connected via Nabu Casa**.
+
 ## Keyboard
 
-With the panel open: `j`/`k` or arrows move, `←`/`→` switch area tabs, `enter`
+The Assist field is focused when you open a connected panel. `enter` sends,
+`↓` moves to devices, `/` returns to Assist, `esc` closes.
+
+On the device list: `j`/`k` or arrows move, `←`/`→` switch area tabs, `enter`
 turns the highlighted device on or off, `e` expands its controls, `s` opens
-settings, `r` refreshes, `esc` closes, `tab` moves to the next bar panel.
+settings, `r` refreshes, `tab` moves to the next bar panel.
 
 ## What you can control
 
@@ -34,8 +61,7 @@ settings, `r` refreshes, `esc` closes, `tab` moves to the next bar panel.
 | `cover` | Open / stop / close |
 | `climate` | On/off when advertised, plus a target temperature or low/high band |
 | `sensor`, `binary_sensor`, everything else | State display only |
-
-Cameras not yet.
+| `camera` | Stills in the panel; click for a live stream |
 
 ## Scripting
 
@@ -46,6 +72,8 @@ omarchy-shell hass toggleEntity light.desk
 omarchy-shell hass activate scene.movie_night
 omarchy-shell hass expand climate.hallway   # opens the panel, unfolded
 omarchy-shell hass favorite light.desk      # add to / remove from the panel
+omarchy-shell hass assist "turn off the living room lamp"
+omarchy-shell hass assistClear
 omarchy-shell hass status
 omarchy-shell hass settings             # connection settings
 omarchy-shell hass devices              # device picker
@@ -56,6 +84,7 @@ omarchy-shell hass devices              # device picker
 - Omarchy 4 (`schemaVersion: 1` plugin API)
 - Python 3.11 or newer
 - `secret-tool` (libsecret) with a running keyring daemon
+- `mpv` for the optional live camera preview (`omarchy-hass-camera` title)
 
 The pure-Python runtime of `websockets` 17.0.1 is bundled with the plugin and
 loaded from `vendor/`. Users don't need `python-websockets`, `qt6-websockets`,
@@ -81,10 +110,13 @@ Click the gear in the panel header, or press `s` with the panel open. From a
 terminal: `omarchy-shell hass settings`, or `omarchy-shell hass devices`
 to open device picker.
 
-Paste your Home Assistant URL and a long-lived access token (Home Assistant →
-your profile → Security), or flip on **Demo mode** to try the panel against a
-built-in fake house with no instance at all. Then switch to **Devices** and
-star the ones you want in the panel.
+Paste the local Home Assistant URL, optional Nabu Casa remote URL, and a
+long-lived access token (Home Assistant → your profile → Security). The panel
+tries local first and falls back to Nabu Casa when local is unreachable. Or
+flip on **Demo mode** to try the panel against a built-in fake house. Then
+switch to **Panel** to pick
+cameras, battery sensors, and the Assist pipeline, and **Devices** to star the
+ones you want in the list.
 
 ## Debugging
 
@@ -105,6 +137,9 @@ node    tests/test_config.js     # config normalization and secret exclusion
 node    tests/test_store.js      # state and registry projections
 node    tests/test_model.js      # entity formatting and classification
 node    tests/test_row_model.js  # ListModel row projection
+node    tests/test_assist.js     # Assist text and result projection
+node    tests/test_powerwall.js  # Powerwall charge and power projection
+node    tests/test_cameras.js    # Frigate camera catalog and path rules
 python3 tests/test_qml_style.py  # UI house style (fonts, palette, tokens)
 ```
 

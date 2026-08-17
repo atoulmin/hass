@@ -25,6 +25,7 @@ Item {
 
   // Local until Connect, so a half-typed URL never reaches the bridge.
   property string urlDraft: ""
+  property string remoteDraft: ""
   property string tokenDraft: ""
 
   property string query: ""
@@ -66,7 +67,7 @@ Item {
     try {
       var payload = payloadJson ? JSON.parse(payloadJson) : {}
       if (payload.tab === "entities" || payload.tab === "connection"
-          || payload.tab === "general") {
+          || payload.tab === "general" || payload.tab === "panel") {
         root.tab = payload.tab
       }
     } catch (e) {
@@ -88,7 +89,8 @@ Item {
 
   function resetDrafts() {
     if (!service) return
-    root.urlDraft = service.baseUrl
+    root.urlDraft = service.localUrl || service.baseUrl
+    root.remoteDraft = service.remoteUrl || ""
     // The stored token never comes back to screen; blank means "keep it".
     root.tokenDraft = ""
     root.query = ""
@@ -101,7 +103,8 @@ Item {
 
   function applyConnection() {
     if (!service) return
-    if (service.applyConnection(root.urlDraft.trim(), root.tokenDraft, false)) {
+    if (service.applyConnection(root.urlDraft.trim(), root.remoteDraft.trim(),
+                               root.tokenDraft, false)) {
       root.tokenDraft = ""
     }
   }
@@ -135,7 +138,8 @@ Item {
       readonly property int preferredWidth:
         root.tab === "entities" ? Style.space(940) : Style.space(620)
       readonly property int preferredHeight:
-        root.tab === "entities" ? Style.space(620) : Style.space(560)
+        root.tab === "entities" ? Style.space(620)
+          : root.tab === "panel" ? Style.space(640) : Style.space(680)
       width: Math.min(card.preferredWidth, window.width - Style.gapsOut * 2)
       height: Math.min(card.preferredHeight, window.height - Style.gapsOut * 2)
       radius: Style.cornerRadius
@@ -154,6 +158,7 @@ Item {
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
         anchors.rightMargin: card.contentRightInset
+        blocked: panelLoader.item && panelLoader.item.pickerOpen
         onCloseRequested: root.dismiss()
 
         // Anchors, not computed heights: deriving the body from the card
@@ -185,6 +190,7 @@ Item {
             fontSize: Style.font.caption
             options: [{ value: "connection", label: "Connection" },
                       { value: "general", label: "General" },
+                      { value: "panel", label: "Panel" },
                       { value: "entities", label: "Devices" }]
             value: root.tab
             onChanged: function(value) { root.tab = value }
@@ -213,6 +219,14 @@ Item {
           }
 
           Loader {
+            id: panelLoader
+            anchors.fill: parent
+            active: root.tab === "panel"
+            visible: active
+            sourceComponent: panelTab
+          }
+
+          Loader {
             anchors.fill: parent
             active: root.tab === "general"
             visible: active
@@ -224,6 +238,137 @@ Item {
             active: root.tab === "entities"
             visible: active
             sourceComponent: entitiesTab
+          }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ panel
+
+  Component {
+    id: panelTab
+
+    Flickable {
+      id: panelPane
+      clip: true
+      contentWidth: width
+      contentHeight: panelColumn.implicitHeight
+      boundsBehavior: Flickable.StopAtBounds
+      flickableDirection: Flickable.VerticalFlick
+
+      readonly property bool pickerOpen: pipelinePick.popupOpen
+        || cameraPick.popupOpen || chargePick.popupOpen
+        || batteryPick.popupOpen || loadPick.popupOpen
+      readonly property bool live: root.service && root.service.connected
+
+      readonly property var pipelineOptions: {
+        var out = [{ value: "", label: "Preferred pipeline" }]
+        var list = root.service ? root.service.assistPipelines : []
+        for (var i = 0; i < list.length; i++) {
+          out.push({
+            value: list[i].id,
+            label: list[i].name,
+            description: list[i].id
+          })
+        }
+        return out
+      }
+
+      Column {
+        id: panelColumn
+        width: panelPane.width
+        spacing: Style.spacing.xxxl
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          text: panelPane.live
+            ? "Choose what the bar panel shows. Changes save immediately."
+            : "Connect to Home Assistant first to load cameras, sensors, and Assist pipelines."
+          wrapMode: Text.WordWrap
+          color: Color.muted
+          font.family: root.family
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Dropdown {
+          id: pipelinePick
+          width: parent.width
+          label: "ASSIST PIPELINE"
+          foreground: root.foreground
+          fontFamily: root.family
+          value: root.service ? root.service.assistPipelineId : ""
+          options: panelPane.pipelineOptions
+          onChanged: function(value) {
+            if (root.service) root.service.setAssistPipeline(value)
+          }
+        }
+
+        MultiSelect {
+          id: cameraPick
+          width: parent.width
+          label: "CAMERAS"
+          foreground: root.foreground
+          fontFamily: root.family
+          values: root.service ? root.service.cameraIds : []
+          options: root.service
+            ? (root.shownRevision, root.service.optionList("camera")) : []
+          noSelectionText: "Using defaults when those cameras exist"
+          emptyText: "No cameras found"
+          onChanged: function(values) {
+            if (root.service) root.service.setCameraIds(values)
+          }
+        }
+
+        SearchableDropdown {
+          id: chargePick
+          width: parent.width
+          label: "BATTERY CHARGE"
+          foreground: root.foreground
+          fontFamily: root.family
+          placeholderText: "Search battery sensors…"
+          emptyText: "No battery sensors found"
+          value: root.service ? root.service.chargeEntityId : ""
+          options: root.service
+            ? (root.shownRevision, root.service.optionList("battery")) : []
+          onChanged: function(value) {
+            if (root.service) root.service.setBatteryEntities(
+              value, root.service.batteryPowerEntityId, root.service.loadPowerEntityId)
+          }
+        }
+
+        SearchableDropdown {
+          id: batteryPick
+          width: parent.width
+          label: "BATTERY POWER"
+          foreground: root.foreground
+          fontFamily: root.family
+          placeholderText: "Search power sensors…"
+          emptyText: "No power sensors found"
+          value: root.service ? root.service.batteryPowerEntityId : ""
+          options: root.service
+            ? (root.shownRevision, root.service.optionList("power")) : []
+          onChanged: function(value) {
+            if (root.service) root.service.setBatteryEntities(
+              root.service.chargeEntityId, value, root.service.loadPowerEntityId)
+          }
+        }
+
+        SearchableDropdown {
+          id: loadPick
+          width: parent.width
+          label: "HOME LOAD"
+          foreground: root.foreground
+          fontFamily: root.family
+          placeholderText: "Search power sensors…"
+          emptyText: "No power sensors found"
+          value: root.service ? root.service.loadPowerEntityId : ""
+          options: root.service
+            ? (root.shownRevision, root.service.optionList("power")) : []
+          onChanged: function(value) {
+            if (root.service) root.service.setBatteryEntities(
+              root.service.chargeEntityId, root.service.batteryPowerEntityId, value)
           }
         }
       }
@@ -255,8 +400,11 @@ Item {
       readonly property bool paused: connectionPane.live && connectionPane.stalled
       readonly property bool keyringBusy: root.service && root.service.credentialBusy
       readonly property bool needsToken: root.service
-        ? root.service.requiresTokenFor(root.urlDraft.trim()) : true
-      readonly property bool validUrl: Connection.normalizeOrigin(root.urlDraft) !== ""
+        ? root.service.requiresTokenFor(root.urlDraft.trim(), root.remoteDraft.trim())
+        : true
+      readonly property bool validUrl:
+        Connection.normalizeOrigin(root.urlDraft) !== ""
+        || Connection.normalizeOrigin(root.remoteDraft) !== ""
       readonly property bool canConnect: validUrl && !keyringBusy
         && (!needsToken || root.tokenDraft.length > 0)
 
@@ -271,7 +419,7 @@ Item {
 
           Text {
             textFormat: Text.PlainText
-            text: "Home Assistant URL"
+            text: "Local address"
             color: Color.muted
             font.family: root.family
             font.pixelSize: Style.font.bodySmall
@@ -280,7 +428,7 @@ Item {
           TextField {
             width: connectionColumn.width
             text: root.urlDraft
-            placeholderText: "https://homeassistant.local:8123"
+            placeholderText: "http://homeassistant.local:8123"
             onTextChanged: root.urlDraft = text
           }
 
@@ -290,6 +438,36 @@ Item {
             visible: root.urlDraft.trim().toLowerCase().indexOf("http://") === 0
               || root.urlDraft.trim().toLowerCase().indexOf("ws://") === 0
             text: "Warning: this URL sends your long-lived access token without transport encryption. Use HTTPS unless this is a trusted local network."
+            color: Color.muted
+            font.family: root.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Column {
+          width: connectionColumn.width
+          spacing: Style.spacing.sm
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Nabu Casa remote address"
+            color: Color.muted
+            font.family: root.family
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          TextField {
+            width: connectionColumn.width
+            text: root.remoteDraft
+            placeholderText: "https://xxxxxxxx.ui.nabu.casa"
+            onTextChanged: root.remoteDraft = text
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: connectionColumn.width
+            text: "The panel tries the local address first, then this URL if local is unreachable."
             color: Color.muted
             font.family: root.family
             font.pixelSize: Style.font.caption
@@ -322,7 +500,8 @@ Item {
           Text {
             textFormat: Text.PlainText
             width: connectionColumn.width
-            visible: connectionPane.needsToken && root.urlDraft.trim().length > 0
+            visible: connectionPane.needsToken
+              && (root.urlDraft.trim().length > 0 || root.remoteDraft.trim().length > 0)
             text: "Changing the server origin requires entering its token again."
             color: Color.muted
             font.family: root.family
@@ -413,8 +592,8 @@ Item {
               if (!root.service.configured) return "Not connected"
               switch (root.service.phase) {
               case "connected":
-                return (root.service.demoMode ? "Demo running · " : "Connected · ")
-                  + Object.keys(root.service.states).length + " devices"
+                return root.service.connectionStatus
+                  + " · " + Object.keys(root.service.states).length + " devices"
               case "connecting": return root.service.lastError
                 ? "Connecting… · " + root.service.lastError
                 : "Connecting…"

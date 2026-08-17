@@ -38,6 +38,8 @@ const parsed = Config.parse(JSON.stringify({
 }), ["light.demo"]);
 eq("typed values are normalized", parsed.config, {
   baseUrl: "",
+  localUrl: "",
+  remoteUrl: "",
   demoMode: true,
   favorites: ["light.a"],
   demoFavorites: [],
@@ -45,7 +47,12 @@ eq("typed values are normalized", parsed.config, {
   showEntityIcons: false,
   selectedTab: "area:kitchen",
   displayNameOverrides: { "light.a": "Desk" },
-  iconOverrides: {}
+  iconOverrides: {},
+  cameraIds: [],
+  chargeEntityId: "",
+  batteryPowerEntityId: "",
+  loadPowerEntityId: "",
+  assistPipelineId: ""
 });
 
 const merged = Config.merge(parsed.config, {
@@ -58,6 +65,24 @@ eq("unknown and secret keys are dropped", merged.token, undefined);
 eq("serialized config has one trailing newline",
    Config.serialize(merged).endsWith("}\n"), true);
 eq("serialized config contains no token", Config.serialize(merged).includes("token"), false);
+
+const panel = Config.parse(JSON.stringify({
+  cameraIds: ["camera.frontyard", "light.x", "camera.frontyard", "not-an-id"],
+  chargeEntityId: "sensor.home_percentage_charged",
+  assistPipelineId: "01ab-cd"
+}), []);
+eq("camera ids are unique camera-like entities", panel.config.cameraIds,
+   ["camera.frontyard"]);
+eq("charge entity is kept", panel.config.chargeEntityId,
+   "sensor.home_percentage_charged");
+eq("pipeline id is kept", panel.config.assistPipelineId, "01ab-cd");
+
+const migrated = Config.parse(JSON.stringify({
+  baseUrl: "http://192.168.0.123:8123"
+}), []);
+eq("legacy baseUrl becomes the local URL", migrated.config.localUrl,
+   "http://192.168.0.123:8123");
+eq("legacy configs have no remote URL", migrated.config.remoteUrl, "");
 
 console.log();
 if (failures) {

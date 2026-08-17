@@ -672,6 +672,234 @@ def test_demo_needs_no_server():
             lambda e: e["ev"] == "state_changed"
             and e["entity"]["entity_id"].startswith("climate."), budget=12)
         check("emits unprompted events", drift is not None)
+
+        bridge.send({"op": "conversation", "text": "turn off the lamp",
+                     "tag": "assist-demo"})
+        spoken = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-demo")
+        check("demo Assist replies",
+              spoken is not None and spoken.get("ok")
+              and spoken.get("speech") == "Turned off Living Room Lamp", spoken)
+        lamp = bridge.wait_for(
+            lambda e: e["ev"] == "state_changed"
+            and e["entity"]["entity_id"] == "light.living_room_lamp"
+            and e["entity"]["state"] == "off")
+        check("demo Assist mutates the house", lamp is not None)
+    finally:
+        bridge.stop()
+
+
+def test_conversation_happy_path():
+    print("assist: text runs the preferred pipeline and returns speech")
+    server = FakeHA()
+    bridge = BridgeProc()
+    try:
+        bridge.send({"op": "config", "url": server.url, "token": "tok"})
+        bridge.wait_for(lambda e: e["ev"] == "phase" and e["phase"] == "connected")
+
+        bridge.send({"op": "conversation", "text": "turn on the lights",
+                     "conversation_id": "conv-1", "tag": "assist-1"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-1")
+        check("returns speech",
+              result is not None and result.get("ok")
+              and result.get("speech") == "Turned Test Light on", result)
+        check("echoes the conversation id",
+              result is not None and result.get("conversation_id") == "conv-1", result)
+        check("does not leak the raw intent payload",
+              result is not None and "intent_output" not in result, result)
+
+        sent = server.conversations[0] if server.conversations else {}
+        check("uses the preferred Assist pipeline",
+              sent.get("type") == "assist_pipeline/run"
+              and sent.get("start_stage") == "intent"
+              and sent.get("end_stage") == "intent", sent)
+        check("forwards the sentence",
+              (sent.get("input") or {}).get("text") == "turn on the lights", sent)
+        check("forwards the conversation id",
+              sent.get("conversation_id") == "conv-1", sent)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def test_conversation_rejection_is_reported():
+    print("assist: a failed pipeline comes back tagged")
+    server = FakeHA(fail_conversations=True)
+    bridge = BridgeProc()
+    try:
+        bridge.send({"op": "config", "url": server.url, "token": "tok"})
+        bridge.wait_for(lambda e: e["ev"] == "phase" and e["phase"] == "connected")
+
+        bridge.send({"op": "conversation", "text": "turn on the lights",
+                     "tag": "assist-fail"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-fail")
+        check("reports the failure", result is not None and not result["ok"], result)
+        check("keeps the server's reason",
+              result is not None and "pipeline" in result.get("error", "").lower(),
+              result)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def test_conversation_rejects_empty_text():
+    print("assist: empty text is refused without a pipeline run")
+    server = FakeHA()
+    bridge = BridgeProc()
+    try:
+        bridge.send({"op": "config", "url": server.url, "token": "tok"})
+        bridge.wait_for(lambda e: e["ev"] == "phase" and e["phase"] == "connected")
+
+        bridge.send({"op": "conversation", "text": "   ", "tag": "assist-empty"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-empty")
+        check("rejects empty text",
+              result is not None and not result["ok"], result)
+        check("does not start a pipeline", server.conversations == [],
+              server.conversations)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def test_conversation_hostile_payload_is_safe():
+    print("assist: a hostile intent payload still completes")
+    server = FakeHA(hostile_conversation=True)
+    bridge = BridgeProc()
+    try:
+        bridge.send({"op": "config", "url": server.url, "token": "tok"})
+        bridge.wait_for(lambda e: e["ev"] == "phase" and e["phase"] == "connected")
+
+        bridge.send({"op": "conversation", "text": "hello", "tag": "assist-hostile"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-hostile")
+        check("still succeeds",
+              result is not None and result.get("ok"), result)
+        check("falls back to a safe reply",
+              result is not None and result.get("speech") == "Done.", result)
+        check("does not forward the hostile payload",
+              result is not None and "intent_output" not in result
+              and not isinstance(result.get("speech"), list), result)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def test_conversation_redacts_token_from_speech():
+    print("assist: a malicious reply cannot echo the access token")
+    token = "TOP_SECRET_ASSIST_TOKEN"
+    server = FakeHA(echo_conversation_token=True)
+    bridge = BridgeProc()
+    try:
+        bridge.send({"op": "config", "url": server.url, "token": token})
+        bridge.wait_for(lambda e: e["ev"] == "phase" and e["phase"] == "connected")
+
+        bridge.send({"op": "conversation", "text": "hello", "tag": "assist-secret"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "assist-secret")
+        serialized = json.dumps(bridge.snapshot())
+        check("returns a result", result is not None and result.get("ok"), result)
+        check("token is redacted from speech",
+              result is not None and token not in (result.get("speech") or "")
+              and "[redacted]" in (result.get("speech") or ""), result)
+        check("token is absent from every NDJSON event", token not in serialized,
+              serialized)
+    finally:
+        bridge.stop()
+        server.stop()
+
+
+def _load_bridge_module():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("hass_bridge", BRIDGE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_snapshot_helpers_reject_hostile_input():
+    print("cameras: snapshot helpers reject hostile entity ids and dests")
+    module = _load_bridge_module()
+    check("keeps only camera.* ids",
+          module.normalize_camera_ids(
+              ["camera.frontyard", "light.x", "camera.evil/../x",
+               "camera.driveway", "camera.frontyard"])
+          == ["camera.frontyard", "camera.driveway"])
+    home = os.path.expanduser("~")
+    ok = os.path.join(home, ".cache", "omarchy", "hass", "cameras")
+    check("allows the plugin cache dir",
+          module.normalize_camera_dest(ok) == os.path.abspath(ok))
+    check("rejects dest outside the cache root",
+          module.normalize_camera_dest("/tmp/hass-cameras") == "")
+
+
+def test_snapshot_fetch_does_not_use_proxy_or_leak_token():
+    print("cameras: still fetch ignores proxies and writes a local jpeg")
+    import http.server
+    import socketserver
+    import tempfile
+
+    module = _load_bridge_module()
+    jpeg = b"\xff\xd8\xff\xd9"
+    token = "SNAP_SECRET_TOKEN"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("Authorization") != "Bearer " + token:
+                self.send_error(401)
+                return
+            if self.path != "/api/camera_proxy/camera.frontyard":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.end_headers()
+            self.wfile.write(jpeg)
+
+        def log_message(self, format, *args):
+            return
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    dest_root = os.path.join(os.path.expanduser("~"), ".cache", "omarchy", "hass")
+    os.makedirs(dest_root, exist_ok=True)
+    dest = tempfile.mkdtemp(prefix="cameras-", dir=dest_root)
+    try:
+        path = module.fetch_camera_snapshot(
+            "http://127.0.0.1:%d" % server.server_address[1],
+            token, "camera.frontyard", dest)
+        check("writes a jpeg",
+              path and os.path.isfile(path) and open(path, "rb").read() == jpeg,
+              path)
+        check("names the file from the entity id",
+              path.endswith("camera_frontyard.jpg"), path)
+    finally:
+        server.shutdown()
+        try:
+            for name in os.listdir(dest):
+                os.remove(os.path.join(dest, name))
+            os.rmdir(dest)
+        except OSError:
+            pass
+
+
+def test_snapshots_while_disconnected_fail_fast():
+    print("cameras: snapshots fail immediately while disconnected")
+    bridge = BridgeProc()
+    try:
+        dest = os.path.join(os.path.expanduser("~"),
+                            ".cache", "omarchy", "hass", "cameras")
+        bridge.send({"op": "snapshots", "entities": ["camera.frontyard"],
+                     "dest": dest, "tag": "snap"})
+        result = bridge.wait_for(
+            lambda e: e["ev"] == "result" and e.get("tag") == "snap")
+        check("reports not connected",
+              result is not None and not result["ok"], result)
     finally:
         bridge.stop()
 
@@ -702,7 +930,15 @@ def main():
                  test_wss_certificate_policy,
                  test_invalid_websocket_message_is_controlled,
                  test_fragment_flood_hits_size_limit,
-                 test_demo_needs_no_server):
+                 test_demo_needs_no_server,
+                 test_conversation_happy_path,
+                 test_conversation_rejection_is_reported,
+                 test_conversation_rejects_empty_text,
+                 test_conversation_hostile_payload_is_safe,
+                 test_conversation_redacts_token_from_speech,
+                 test_snapshot_helpers_reject_hostile_input,
+                 test_snapshot_fetch_does_not_use_proxy_or_leak_token,
+                 test_snapshots_while_disconnected_fail_fast):
         test()
         print()
 

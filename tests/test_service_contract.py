@@ -118,6 +118,20 @@ def main():
           and "Model.capabilitiesFor(entity)" in service)
     check("selected tab persistence is debounced",
           "selectedTabSaveDebounce.restart()" in service)
+    check("Assist conversation state is not persisted",
+          "conversation_id" not in current_config.lower()
+          and "assistConversationId" not in current_config)
+    check("Assist replies are correlated by tagged results",
+          'tag.indexOf("assist:")' in function_block("handleResult")
+          and 'op: "conversation"' in function_block("sendAssist"))
+    check("Assist conversation expires after a minute of silence",
+          "Assist.IDLE_MS" in service
+          and "assistIdle.restart()" in function_block("touchAssistIdle")
+          and "assistIdle.stop()" in function_block("resetAssist"))
+    check("camera stills live under the user cache directory",
+          ".cache/omarchy/hass/cameras" in service)
+    check("snapshot failures do not become panel errors",
+          'tag === "snap"' in function_block("handleResult"))
 
     check("bridge never accepts the token in argv",
           "access_token" in bridge and '"--token"' not in bridge)

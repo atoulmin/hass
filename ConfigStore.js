@@ -1,8 +1,10 @@
 .pragma library
 
 var KEYS = [
-  "baseUrl", "demoMode", "favorites", "demoFavorites", "groupByArea",
-  "showEntityIcons", "selectedTab", "displayNameOverrides", "iconOverrides"
+  "baseUrl", "localUrl", "remoteUrl", "demoMode", "favorites", "demoFavorites", "groupByArea",
+  "showEntityIcons", "selectedTab", "displayNameOverrides", "iconOverrides",
+  "cameraIds", "chargeEntityId", "batteryPowerEntityId", "loadPowerEntityId",
+  "assistPipelineId"
 ]
 
 function stringList(value, fallback) {
@@ -18,6 +20,18 @@ function stringList(value, fallback) {
     }
   }
   return out
+}
+
+function entityId(value) {
+  if (typeof value !== "string") return ""
+  return /^[a-z0-9_]+\.[a-z0-9_]+$/.test(value) ? value : ""
+}
+
+function pipelineId(value) {
+  if (typeof value !== "string") return ""
+  var id = value.trim()
+  if (!id || id.length > 128) return ""
+  return /^[A-Za-z0-9_-]+$/.test(id) ? id : ""
 }
 
 function plainMap(value) {
@@ -47,7 +61,13 @@ function parse(text, demoDefaults) {
   return {
     error: error,
     config: {
-      baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl : "",
+      baseUrl: typeof raw.localUrl === "string" && raw.localUrl
+        ? raw.localUrl
+        : (typeof raw.baseUrl === "string" ? raw.baseUrl : ""),
+      localUrl: typeof raw.localUrl === "string" && raw.localUrl
+        ? raw.localUrl
+        : (typeof raw.baseUrl === "string" ? raw.baseUrl : ""),
+      remoteUrl: typeof raw.remoteUrl === "string" ? raw.remoteUrl : "",
       demoMode: raw.demoMode === true,
       favorites: stringList(raw.favorites, []),
       demoFavorites: stringList(raw.demoFavorites,
@@ -57,7 +77,14 @@ function parse(text, demoDefaults) {
       selectedTab: typeof raw.selectedTab === "string" && raw.selectedTab
         ? raw.selectedTab : "favorites",
       displayNameOverrides: plainMap(raw.displayNameOverrides),
-      iconOverrides: plainMap(raw.iconOverrides)
+      iconOverrides: plainMap(raw.iconOverrides),
+      cameraIds: stringList(raw.cameraIds, []).filter(function(id) {
+        return id.indexOf("camera.") === 0
+      }).slice(0, 6),
+      chargeEntityId: entityId(raw.chargeEntityId),
+      batteryPowerEntityId: entityId(raw.batteryPowerEntityId),
+      loadPowerEntityId: entityId(raw.loadPowerEntityId),
+      assistPipelineId: pipelineId(raw.assistPipelineId)
     }
   }
 }
